@@ -1,399 +1,268 @@
 """
-NSE Stock Analysis API — for n8n integration
-================================================================================
-A single FastAPI service that does ALL the real work (data pull + every
-indicator built in our Jupyter session) and exposes it as one clean HTTP
-endpoint. n8n calls this URL and gets back a complete JSON analysis for
-ANY NSE-listed company — no coding required inside n8n itself.
-
-REQUIREMENTS
-------------
-    pip install fastapi uvicorn yfinance pandas numpy
-
-RUN LOCALLY (for testing in Jupyter/terminal)
------------------------------------------------
-    uvicorn nse_analysis_api:app --reload --port 8000
-
-Then test in your browser or Jupyter:
-    http://127.0.0.1:8000/analyze/RELIANCE
-
-EXPOSING THIS TO n8n
----------------------
-- If n8n runs on the SAME machine: use http://127.0.0.1:8000 directly (self-hosted n8n)
-- If n8n is in the cloud (n8n.cloud) or on a different machine: you need a
-  public URL. Easiest free options:
-    1. ngrok (quick, good for testing):  ngrok http 8000
-       -> gives you a temporary public URL like https://abc123.ngrok.io
-    2. Deploy this file properly on Render.com or Railway.app (free tier)
-       for a permanent URL — recommended once you move past testing
-
-USAGE FROM n8n
----------------
-In n8n, add an "HTTP Request" node:
-    Method: GET
-    URL: http://YOUR_URL/analyze/{{ $json.symbol }}
-No code needed on the n8n side at all — this endpoint does everything.
+NSE Stock Dashboard (Streamlit) — reuses the indicator functions in nse_analysis_api.py
+Run locally:  streamlit run streamlit_app.py
 """
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import yfinance as yf
+import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-app = FastAPI(title="NSE Stock Analysis API")
-
-# Allow any frontend (v0.dev, Lovable, or anywhere else) to call this API from the browser
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+from nse_analysis_api import (
+    calculate_rsi,
+    calculate_macd,
+    calculate_moving_averages,
+    calculate_bollinger_bands,
+    get_technical_snapshot,
+    get_fundamentals,
 )
 
-# ── INDICATOR FUNCTIONS (same ones built in our Jupyter session today) ────
-
-def calculate_rsi(prices, period=14):
-    delta = prices.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_roc(prices, period=12):
-    return prices.pct_change(period) * 100
-
-def calculate_macd(prices, fast=12, slow=26, signal=9):
-    ema_fast = prices.ewm(span=fast, adjust=False).mean()
-    ema_slow = prices.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line, macd_line - signal_line
-
-def calculate_moving_averages(prices, short_window=50, long_window=200):
-    ma_short = prices.rolling(short_window).mean()
-    ma_long = prices.rolling(long_window).mean()
-    return ma_short, ma_long
-
-def calculate_adx(high, low, close, period=14):
-    plus_dm = high.diff(); minus_dm = -low.diff()
-    plus_dm[plus_dm < 0] = 0; minus_dm[minus_dm < 0] = 0
-    plus_dm[(plus_dm - minus_dm) < 0] = 0; minus_dm[(minus_dm - plus_dm) < 0] = 0
-    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    return dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-
-def calculate_52w_high_proximity(prices, window=252):
-    return (prices / prices.rolling(window).max()) * 100
-
-def calculate_bollinger_bands(prices, window=20, num_std=2):
-    middle = prices.rolling(window).mean()
-    std = prices.rolling(window).std()
-    upper = middle + (num_std * std)
-    lower = middle - (num_std * std)
-    percent_b = (prices - lower) / (upper - lower)
-    bandwidth = (upper - lower) / middle * 100
-    return percent_b, bandwidth
-
-def get_yoy_earnings_growth(net_income, tolerance_days=45):
-    """Date-matched YoY growth — the corrected version, fixing the bug
-    we caught earlier today where fixed-position matching broke on
-    stocks with an irregularly reported quarter."""
-    if len(net_income) < 2:
-        return None, None
-    latest_date = net_income.index[0]
-    latest_val = net_income.iloc[0]
-    target_date = latest_date - pd.DateOffset(months=12)
-    date_diffs = (net_income.index - target_date).days.to_series(index=net_income.index).abs()
-    closest_idx = date_diffs.idxmin()
-    if date_diffs[closest_idx] > tolerance_days:
-        return None, None
-    base_val = net_income.loc[closest_idx]
-    if base_val == 0 or pd.isna(base_val):
-        return None, None
-    return round(((latest_val / base_val) - 1) * 100, 2), str(closest_idx.date())
+st.set_page_config(page_title="NSE Stock Dashboard", page_icon="📈", layout="wide")
 
 
-def safe_round(val, decimals=2):
-    if val is None or pd.isna(val):
-        return None
-    return round(float(val), decimals)
+# ── Helpers ────────────────────────────────────────────────────────────────
+def to_ticker(symbol: str) -> str:
+    symbol = symbol.upper().strip()
+    return symbol if symbol.endswith(".NS") else f"{symbol}.NS"
 
 
-def get_yoy_revenue_growth(revenue, tolerance_days=45):
-    """Same date-matched logic as earnings growth, applied to revenue."""
-    return get_yoy_earnings_growth(revenue, tolerance_days)
+@st.cache_data(ttl=900, show_spinner=False)
+def load_history(ticker: str, period: str = "2y") -> pd.DataFrame:
+    return yf.Ticker(ticker).history(period=period, auto_adjust=True)
 
 
-def get_fundamentals(stock):
-    """Extended fundamentals: earnings growth, revenue growth, margins, ROE, debt-to-equity.
-
-    IMPORTANT: this deliberately avoids stock.info — Yahoo Finance blocks/rate-limits
-    that specific endpoint for many cloud hosting providers (Render, Railway, Heroku),
-    returning an almost-empty dict even though the price-history endpoint works fine.
-    Instead, everything here is calculated directly from the income statement and
-    balance sheet, which use the endpoint that's actually working for us."""
-    fundamentals = {
-        "yoy_earnings_growth_pct": None,
-        "earnings_base_quarter": None,
-        "yoy_revenue_growth_pct": None,
-        "revenue_base_quarter": None,
-        "operating_margin_pct": None,
-        "net_margin_pct": None,
-        "roe_pct": None,
-        "debt_to_equity": None,
-        "market_cap_cr": None,
-    }
-
-    latest_revenue = None
-    latest_net_income = None
-    latest_operating_income = None
-
-    try:
-        income_stmt = stock.quarterly_income_stmt
-        if income_stmt is not None:
-            if "Net Income" in income_stmt.index:
-                net_income = income_stmt.loc["Net Income"].dropna()
-                growth, base_date = get_yoy_earnings_growth(net_income)
-                fundamentals["yoy_earnings_growth_pct"] = growth
-                fundamentals["earnings_base_quarter"] = base_date
-                if len(net_income) > 0:
-                    latest_net_income = net_income.iloc[0]
-
-            if "Total Revenue" in income_stmt.index:
-                revenue = income_stmt.loc["Total Revenue"].dropna()
-                growth, base_date = get_yoy_revenue_growth(revenue)
-                fundamentals["yoy_revenue_growth_pct"] = growth
-                fundamentals["revenue_base_quarter"] = base_date
-                if len(revenue) > 0:
-                    latest_revenue = revenue.iloc[0]
-
-            if "Operating Income" in income_stmt.index:
-                op_income = income_stmt.loc["Operating Income"].dropna()
-                if len(op_income) > 0:
-                    latest_operating_income = op_income.iloc[0]
-
-        # margins calculated directly — same math a real analyst would do by hand
-        if latest_revenue and latest_revenue != 0:
-            if latest_net_income is not None:
-                fundamentals["net_margin_pct"] = safe_round((latest_net_income / latest_revenue) * 100)
-            if latest_operating_income is not None:
-                fundamentals["operating_margin_pct"] = safe_round((latest_operating_income / latest_revenue) * 100)
-
-    except Exception as e:
-        fundamentals["_debug_income_stmt_error"] = str(e)
-
-    try:
-        balance_sheet = stock.quarterly_balance_sheet
-        if balance_sheet is not None:
-            equity = None
-            total_debt = None
-
-            for equity_label in ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"]:
-                if equity_label in balance_sheet.index:
-                    equity_series = balance_sheet.loc[equity_label].dropna()
-                    if len(equity_series) > 0:
-                        equity = equity_series.iloc[0]
-                        break
-
-            for debt_label in ["Total Debt", "Net Debt"]:
-                if debt_label in balance_sheet.index:
-                    debt_series = balance_sheet.loc[debt_label].dropna()
-                    if len(debt_series) > 0:
-                        total_debt = debt_series.iloc[0]
-                        break
-
-            if equity and equity != 0:
-                if total_debt is not None:
-                    fundamentals["debt_to_equity"] = safe_round(total_debt / equity)
-                # ROE using latest quarter's net income annualized (x4) against latest equity —
-                # a simplified TTM-style approximation, standard when only one quarter is available
-                if latest_net_income is not None:
-                    fundamentals["roe_pct"] = safe_round(((latest_net_income * 4) / equity) * 100)
-
-    except Exception as e:
-        fundamentals["_debug_balance_sheet_error"] = str(e)
-
-    # market cap: try the lighter fast_info endpoint, which is less likely to be blocked
-    # than the full .info dict — separate try block so a failure here doesn't affect anything above
-    try:
-        fast_info = stock.fast_info
-        if fast_info and fast_info.get("marketCap"):
-            fundamentals["market_cap_cr"] = safe_round(fast_info["marketCap"] / 1e7)
-    except Exception:
-        pass  # market cap is a nice-to-have; not worth failing the request over
-
-    return fundamentals
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_fundamentals(ticker: str) -> dict:
+    return get_fundamentals(yf.Ticker(ticker))
 
 
-def get_technical_snapshot(hist):
-    """The core technical calculation, factored out so both /analyze and /watchlist can reuse it."""
+def signal_score(t: dict):
+    """Simple rule-based score from the technical snapshot. Educational only."""
+    score, reasons = 0, []
+    rsi = t.get("rsi_14")
+    if rsi is not None:
+        if rsi < 30:
+            score += 1; reasons.append(f"RSI {rsi} is oversold (<30)")
+        elif rsi > 70:
+            score -= 1; reasons.append(f"RSI {rsi} is overbought (>70)")
+        else:
+            reasons.append(f"RSI {rsi} is neutral")
+    if t.get("macd_histogram") is not None:
+        if t["macd_histogram"] > 0:
+            score += 1; reasons.append("MACD histogram positive (bullish momentum)")
+        else:
+            score -= 1; reasons.append("MACD histogram negative (bearish momentum)")
+    if t.get("ma_trend") == "bullish":
+        score += 1; reasons.append("50-DMA above 200-DMA (golden-cross regime)")
+    elif t.get("ma_trend") == "bearish":
+        score -= 1; reasons.append("50-DMA below 200-DMA (death-cross regime)")
+    if t.get("ma_50") and t.get("current_price"):
+        if t["current_price"] > t["ma_50"]:
+            score += 1; reasons.append("Price above 50-DMA")
+        else:
+            score -= 1; reasons.append("Price below 50-DMA")
+    adx = t.get("adx_14")
+    if adx is not None:
+        reasons.append(f"ADX {adx}: " + ("strong trend" if adx > 25 else "weak/no trend"))
+    label = "Bullish" if score >= 2 else "Bearish" if score <= -2 else "Neutral"
+    return score, label, reasons
+
+
+def build_chart(hist: pd.DataFrame, months: int, show_bb: bool) -> go.Figure:
     close = hist["Close"]
-    high = hist["High"]
-    low = hist["Low"]
-
-    daily_pct_change = close.pct_change()
-    corporate_action_flag = bool((daily_pct_change.abs() > 0.15).any())
-
-    rsi = calculate_rsi(close)
-    roc = calculate_roc(close)
-    macd_line, signal_line, macd_hist = calculate_macd(close)
     ma50, ma200 = calculate_moving_averages(close)
-    adx = calculate_adx(high, low, close)
-    high52 = calculate_52w_high_proximity(close)
-    percent_b, bandwidth = calculate_bollinger_bands(close)
+    rsi = calculate_rsi(close)
+    macd_line, sig_line, macd_hist = calculate_macd(close)
+    middle = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    upper, lower = middle + 2 * std, middle - 2 * std
 
-    ma_trend = None
-    if not pd.isna(ma50.iloc[-1]) and not pd.isna(ma200.iloc[-1]):
-        ma_trend = "bullish" if ma50.iloc[-1] > ma200.iloc[-1] else "bearish"
+    n = months * 21
+    h = hist.tail(n)
+    idx = h.index
 
-    technical = {
-        "current_price": safe_round(close.iloc[-1]),
-        "rsi_14": safe_round(rsi.iloc[-1]),
-        "roc_12": safe_round(roc.iloc[-1]),
-        "macd_line": safe_round(macd_line.iloc[-1]),
-        "macd_signal": safe_round(signal_line.iloc[-1]),
-        "macd_histogram": safe_round(macd_hist.iloc[-1]),
-        "ma_50": safe_round(ma50.iloc[-1]),
-        "ma_200": safe_round(ma200.iloc[-1]),
-        "ma_trend": ma_trend,
-        "adx_14": safe_round(adx.iloc[-1]),
-        "pct_of_52w_high": safe_round(high52.iloc[-1]),
-        "bollinger_percent_b": safe_round(percent_b.iloc[-1], 3),
-        "bollinger_bandwidth_pct": safe_round(bandwidth.iloc[-1]),
-    }
-    return technical, corporate_action_flag
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+        row_heights=[0.6, 0.2, 0.2],
+        subplot_titles=("Price", "RSI (14)", "MACD"),
+    )
+    fig.add_trace(go.Candlestick(x=idx, open=h["Open"], high=h["High"], low=h["Low"],
+                                 close=h["Close"], name="Price"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=ma50.loc[idx], name="MA50", line=dict(width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=ma200.loc[idx], name="MA200", line=dict(width=1.5)), row=1, col=1)
+    if show_bb:
+        fig.add_trace(go.Scatter(x=idx, y=upper.loc[idx], name="BB upper",
+                                 line=dict(width=1, dash="dot")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=idx, y=lower.loc[idx], name="BB lower",
+                                 line=dict(width=1, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=rsi.loc[idx], name="RSI"), row=2, col=1)
+    fig.add_hline(y=70, line_dash="dash", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dash", row=2, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=macd_line.loc[idx], name="MACD"), row=3, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=sig_line.loc[idx], name="Signal"), row=3, col=1)
+    fig.add_trace(go.Bar(x=idx, y=macd_hist.loc[idx], name="Histogram"), row=3, col=1)
+    fig.update_layout(height=800, xaxis_rangeslider_visible=False,
+                      margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
+    return fig
 
 
-@app.get("/")
-def health_check():
-    return {"status": "ok", "message": "NSE Stock Analysis API is running"}
+def backtest_ma_cross(hist: pd.DataFrame, short=50, long=200):
+    close = hist["Close"]
+    ma_s, ma_l = close.rolling(short).mean(), close.rolling(long).mean()
+    position = (ma_s > ma_l).astype(int).shift(1).fillna(0)  # trade next day, no look-ahead
+    ret = close.pct_change().fillna(0)
+    strat = (1 + ret * position).cumprod()
+    bh = (1 + ret).cumprod()
+    years = max((close.index[-1] - close.index[0]).days / 365.25, 0.01)
+
+    def stats(curve):
+        cagr = curve.iloc[-1] ** (1 / years) - 1
+        mdd = (curve / curve.cummax() - 1).min()
+        return round(cagr * 100, 2), round(mdd * 100, 2), round((curve.iloc[-1] - 1) * 100, 2)
+
+    trades = int((position.diff().abs() == 1).sum())
+    return strat, bh, stats(strat), stats(bh), trades
 
 
-@app.get("/analyze/{symbol}")
-def analyze_stock(symbol: str):
-    """Full technical + fundamental analysis for one NSE-listed company."""
-    symbol = symbol.upper().strip()
-    ticker = symbol if symbol.endswith(".NS") else f"{symbol}.NS"
+# ── Sidebar ────────────────────────────────────────────────────────────────
+st.sidebar.title("📈 NSE Dashboard")
+page = st.sidebar.radio("Go to", ["Stock Analysis", "Watchlist", "Compare Stocks", "Backtest"])
+st.sidebar.caption("Data: Yahoo Finance (may be delayed). Educational use only — not investment advice.")
 
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="2y", auto_adjust=True)
+
+# ── Page 1: Stock Analysis ─────────────────────────────────────────────────
+if page == "Stock Analysis":
+    st.title("Stock Analysis")
+    c1, c2, c3 = st.columns([2, 1, 1])
+    symbol = c1.text_input("NSE symbol", "RELIANCE")
+    months = c2.slider("Chart months", 1, 24, 6)
+    show_bb = c3.checkbox("Bollinger Bands", True)
+
+    if symbol:
+        ticker = to_ticker(symbol)
+        hist = load_history(ticker)
         if hist.empty:
-            raise HTTPException(status_code=404, detail=f"No data found for {ticker}. Check the symbol is correct.")
+            st.error(f"No data found for {ticker}. Check the symbol.")
+        else:
+            tech, ca_flag = get_technical_snapshot(hist)
+            score, label, reasons = signal_score(tech)
 
-        technical, corporate_action_flag = get_technical_snapshot(hist)
-        fundamentals = get_fundamentals(stock)
+            if ca_flag:
+                st.warning("A >15% single-day move was detected in the last 2 years (split/demerger?). "
+                           "MA and Bollinger values may be distorted.")
 
-        return {
-            "symbol": ticker,
-            "company_name": ticker,
-            "timestamp": datetime.now().isoformat(),
-            "corporate_action_flag": corporate_action_flag,
-            "corporate_action_note": (
-                "A >15% single-day price move was detected in the last 2 years — "
-                "moving-average and Bollinger figures may be distorted by a demerger, "
-                "split, or similar event. Verify before trusting the technical signals."
-                if corporate_action_flag else None
-            ),
-            "technical": technical,
-            "fundamentals": fundamentals,
-        }
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Price (₹)", tech["current_price"])
+            m2.metric("RSI (14)", tech["rsi_14"])
+            m3.metric("% of 52W high", tech["pct_of_52w_high"])
+            m4.metric("Signal", label, f"score {score:+d}")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error analyzing {ticker}: {str(e)}")
+            st.plotly_chart(build_chart(hist, months, show_bb), use_container_width=True)
+
+            tab1, tab2, tab3 = st.tabs(["Why this signal", "All technicals", "Fundamentals"])
+            with tab1:
+                for r in reasons:
+                    st.write("•", r)
+            with tab2:
+                st.dataframe(pd.DataFrame(tech.items(), columns=["Indicator", "Value"]),
+                             use_container_width=True, hide_index=True)
+            with tab3:
+                with st.spinner("Loading fundamentals..."):
+                    f = load_fundamentals(ticker)
+                st.dataframe(pd.DataFrame(f.items(), columns=["Metric", "Value"]),
+                             use_container_width=True, hide_index=True)
+
+            st.download_button("Download price history (CSV)", hist.to_csv().encode(),
+                               file_name=f"{ticker}_history.csv", mime="text/csv")
 
 
-@app.get("/chart/{symbol}")
-def chart_data(symbol: str, months: int = 6):
-    """
-    OHLC candlestick data + overlay indicator series for charting.
-    Returns one row per trading day: date, OHLCV, RSI, MACD line/signal, MA50, MA200.
-    `months` controls how much history to return in the chart (default 6, max 24).
-    """
-    symbol = symbol.upper().strip()
-    ticker = symbol if symbol.endswith(".NS") else f"{symbol}.NS"
-    months = min(max(months, 1), 24)
-
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="2y", auto_adjust=True)  # need 2y so MA200 has enough lookback, even though we only return the recent slice
-        if hist.empty:
-            raise HTTPException(status_code=404, detail=f"No data found for {ticker}.")
-
-        close = hist["Close"]
-        rsi = calculate_rsi(close)
-        macd_line, signal_line, _ = calculate_macd(close)
-        ma50, ma200 = calculate_moving_averages(close)
-
-        trading_days = months * 21  # approx trading days per month
-        recent = hist.tail(trading_days)
-
+# ── Page 2: Watchlist ──────────────────────────────────────────────────────
+elif page == "Watchlist":
+    st.title("Watchlist")
+    raw = st.text_area("Symbols (comma-separated, max 15)", "RELIANCE, TCS, INFY, HDFCBANK, ITC")
+    if st.button("Scan"):
+        symbols = [s.strip() for s in raw.split(",") if s.strip()][:15]
         rows = []
-        for date, row in recent.iterrows():
-            rows.append({
-                "date": date.strftime("%Y-%m-%d"),
-                "open": safe_round(row["Open"]),
-                "high": safe_round(row["High"]),
-                "low": safe_round(row["Low"]),
-                "close": safe_round(row["Close"]),
-                "volume": int(row["Volume"]) if not pd.isna(row["Volume"]) else None,
-                "rsi": safe_round(rsi.loc[date]) if date in rsi.index else None,
-                "macd_line": safe_round(macd_line.loc[date]) if date in macd_line.index else None,
-                "macd_signal": safe_round(signal_line.loc[date]) if date in signal_line.index else None,
-                "ma_50": safe_round(ma50.loc[date]) if date in ma50.index else None,
-                "ma_200": safe_round(ma200.loc[date]) if date in ma200.index else None,
-            })
+        bar = st.progress(0.0)
+        for i, s in enumerate(symbols):
+            t = to_ticker(s)
+            try:
+                h = load_history(t)
+                if h.empty:
+                    rows.append({"Symbol": t, "Signal": "No data"})
+                else:
+                    tech, flag = get_technical_snapshot(h)
+                    score, label, _ = signal_score(tech)
+                    rows.append({
+                        "Symbol": t, "Price": tech["current_price"], "RSI": tech["rsi_14"],
+                        "MACD hist": tech["macd_histogram"], "MA trend": tech["ma_trend"],
+                        "% of 52W high": tech["pct_of_52w_high"], "Score": score,
+                        "Signal": label, "Corp. action?": flag,
+                    })
+            except Exception as e:
+                rows.append({"Symbol": t, "Signal": f"Error: {e}"})
+            bar.progress((i + 1) / len(symbols))
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.download_button("Download CSV", df.to_csv(index=False).encode(),
+                           file_name="watchlist.csv", mime="text/csv")
 
-        return {"symbol": ticker, "months": months, "data": rows}
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching chart data for {ticker}: {str(e)}")
+# ── Page 3: Compare ────────────────────────────────────────────────────────
+elif page == "Compare Stocks":
+    st.title("Compare Stocks")
+    raw = st.text_input("Symbols (comma-separated)", "RELIANCE, TCS, INFY")
+    period = st.selectbox("Period", ["6mo", "1y", "2y", "5y"], index=1)
+    if raw:
+        series = {}
+        for s in [x.strip() for x in raw.split(",") if x.strip()][:8]:
+            t = to_ticker(s)
+            h = load_history(t, period)
+            if not h.empty:
+                series[t] = h["Close"] / h["Close"].iloc[0] * 100
+        if series:
+            df = pd.DataFrame(series)
+            fig = go.Figure()
+            for col in df.columns:
+                fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col))
+            fig.update_layout(title="Performance rebased to 100", height=500,
+                              margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+            ret = (df.iloc[-1] - 100).round(2).rename("Return %").to_frame()
+            st.dataframe(ret, use_container_width=True)
+            st.subheader("Correlation of daily returns")
+            st.dataframe(df.pct_change().corr().round(2), use_container_width=True)
+        else:
+            st.error("No data found for those symbols.")
 
 
-@app.get("/watchlist")
-def watchlist(symbols: str):
-    """
-    Lightweight multi-stock snapshot for a watchlist view.
-    Pass symbols comma-separated: /watchlist?symbols=RELIANCE,TCS,INFY
-    Capped at 10 symbols per request to keep response time reasonable on free hosting.
-    """
-    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:10]
-    if not symbol_list:
-        raise HTTPException(status_code=400, detail="Provide at least one symbol, e.g. ?symbols=RELIANCE,TCS")
+# ── Page 4: Backtest ───────────────────────────────────────────────────────
+else:
+    st.title("Moving-Average Crossover Backtest")
+    c1, c2, c3, c4 = st.columns(4)
+    symbol = c1.text_input("NSE symbol", "RELIANCE")
+    short = c2.number_input("Short MA", 5, 100, 50)
+    long = c3.number_input("Long MA", 20, 300, 200)
+    period = c4.selectbox("History", ["2y", "5y", "10y"], index=1)
 
-    results = []
-    for symbol in symbol_list:
-        ticker = symbol if symbol.endswith(".NS") else f"{symbol}.NS"
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="2y", auto_adjust=True)
-            if hist.empty:
-                results.append({"symbol": ticker, "error": "No data found"})
-                continue
-
-            technical, corporate_action_flag = get_technical_snapshot(hist)
-            results.append({
-                "symbol": ticker,
-                "company_name": ticker,
-                "current_price": technical["current_price"],
-                "rsi_14": technical["rsi_14"],
-                "macd_histogram": technical["macd_histogram"],
-                "ma_trend": technical["ma_trend"],
-                "pct_of_52w_high": technical["pct_of_52w_high"],
-                "corporate_action_flag": corporate_action_flag,
-            })
-        except Exception as e:
-            results.append({"symbol": ticker, "error": str(e)})
-
-    return {"count": len(results), "stocks": results}
+    if symbol and short < long:
+        t = to_ticker(symbol)
+        h = load_history(t, period)
+        if h.empty:
+            st.error(f"No data for {t}.")
+        else:
+            strat, bh, s_stats, b_stats, trades = backtest_ma_cross(h, int(short), int(long))
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=strat.index, y=strat, name=f"MA {short}/{long} strategy"))
+            fig.add_trace(go.Scatter(x=bh.index, y=bh, name="Buy & hold"))
+            fig.update_layout(title="Growth of ₹1", height=450, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(pd.DataFrame(
+                {"CAGR %": [s_stats[0], b_stats[0]],
+                 "Max drawdown %": [s_stats[1], b_stats[1]],
+                 "Total return %": [s_stats[2], b_stats[2]]},
+                index=["Strategy", "Buy & hold"]), use_container_width=True)
+            st.caption(f"Number of position changes: {trades}. Ignores brokerage, taxes and slippage.")
+    elif short >= long:
+        st.warning("Short MA must be smaller than long MA.")
